@@ -1,0 +1,217 @@
+---
+title: "Feature_Engineering.R"
+output: pdf_document
+date: "2024-10-20"
+---
+
+## Loading the data and preprocessing
+
+```{r}
+data = read.csv("../data/data.csv")
+```
+
+```{r}
+head(data, n=10)
+```
+
+```{r}
+# Load necessary libraries
+library(dplyr)
+library(rstan)
+
+options(mc.cores = parallel::detectCores())
+rstan_options(auto_write = TRUE)
+```
+
+```{r}
+# Prepare the data
+response <- data[, ncol(data)]  # Extract the response variable (last column)
+predictors <- data[2:4025]  # Extract the predictors (excluding date and response)
+
+cat("Number of predictors:", ncol(predictors), "\n")
+cat("Number of observations:", nrow(predictors))
+```
+
+Prepare the data as a `list()` for `RStan`
+
+```{r}
+# Prepare the data list for Stan
+stan_data <- list(
+  N = nrow(predictors),       # Number of observations
+  P = ncol(predictors),       # Number of predictors
+  X = predictors,             # Predictor matrix
+  y = response                # Response variable
+)
+```
+
+```{r}
+sprintf("First %s and last columns %s:", colnames(predictors[0:1]), colnames(predictors[ncol(predictors)]))
+```
+
+## Train a Bayesian regression model with horseshoe prior
+
+```{r}
+# Compile the Stan model
+stan_model_code <- readLines("horseshoe_model.stan")
+stan_model <- stan_model(model_code = stan_model_code)
+
+# Fit the model
+fit <- sampling(
+  stan_model,
+  data = stan_data,
+  iter = 2000,             # Number of iterations
+  chains = 4,              # Number of chains
+  warmup = 500,            # Number of warmup (burn-in) samples
+  thin = 1,                # Thinning interval
+  seed = 123               # Random seed for reproducibility
+)
+```
+
+## Extracting model fit
+
+```{r}
+posterior_samples <- extract(fit)
+beta_shrunk_samples <- posterior_samples$beta_shrunk
+```
+
+```{r}
+
+# Compute the mean of the posterior samples for each coefficient
+beta_shrunk_means <- apply(beta_shrunk_samples, 2, mean)
+
+# Calculate the credible intervals for each coefficient (e.g., 95% credible interval)
+beta_shrunk_ci <- apply(beta_shrunk_samples, 2, quantile, probs = c(0.025, 0.975))
+
+
+```
+
+Make a `data.frame` with names of the predictors, coefficients $\hat{\beta}_j$ and their CIs
+
+```{r}
+# Create a data frame with the feature importance
+feature_importance <- data.frame(
+  Feature = colnames(predictors),
+  Coefficient = beta_shrunk_means[0:4024],
+  CI_Lower = beta_shrunk_ci[1, 0:4024],
+  CI_Upper = beta_shrunk_ci[2, 0:4024]
+)
+
+largest_values <- sort(beta_shrunk_means, decreasing = FALSE)[4025:4026]
+ 
+print(largest_values) 
+
+# Rank the features by the absolute value of the coefficient
+feature_importance <- feature_importance[order(abs(feature_importance$Coefficient), decreasing = TRUE), ]
+
+# Display the top important features
+head(feature_importance, 25)
+
+```
+
+## Analysis of Explained Variance
+
+```{r}
+library(ggplot2)
+# Plot the feature importance based on shrunk coefficients
+top_features <- head(feature_importance, 50)  # Select the top 25 features
+
+ggplot(top_features, aes(x = reorder(Feature, abs(Coefficient)), y = abs(Coefficient))) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Top 25 Most Important Features After Shrinkage",
+       x = "Feature",
+       y = "Absolute Coefficient") +
+  theme_minimal()
+
+
+```
+
+```{r}
+# Calculate cumulative explained variance for all features
+sorted_importance <- feature_importance[order(abs(feature_importance$Coefficient), decreasing = TRUE), ]
+cumulative_variance_all <- cumsum(sorted_importance$Coefficient^2) / sum(sorted_importance$Coefficient^2)
+
+# Calculate cumulative explained variance for the top 50 features
+cumulative_variance_top_50 <- cumsum(sorted_importance$Coefficient[1:50]^2) / sum(sorted_importance$Coefficient^2)
+
+# Create a data frame for the plot
+cumulative_data <- data.frame(
+  Rank = 1:length(cumulative_variance_all),
+  CumulativeVarianceAll = cumulative_variance_all,
+  CumulativeVarianceTop50 = c(cumulative_variance_top_50, rep(NA, length(cumulative_variance_all) - 50))
+)
+
+
+# Plot the cumulative explained variance
+ggplot(cumulative_data, aes(x = Rank)) +
+  geom_line(aes(y = CumulativeVarianceAll, color = "Number of Features"), size = 1) +
+  labs(title = "Cumulative Explained Variance by Features",
+       y = "Cumulative Variance Explained",
+       x = "Number of Features") +
+  scale_color_manual(values = c("Number of Features" = "blue")) +
+  theme_minimal() +
+  theme(legend.title = element_blank(), legend.position = "top")
+
+
+```
+
+## Extracting relevant Stock tickers and their quantity
+
+```{r}
+top_1000_features = head(feature_importance, 500)
+top_1000_features
+```
+
+```{r}
+clean_string <- function(string) {
+  # Words to remove
+  words_to_remove <- c("Daily.Return", "Adj.Close", "EMA", "Open", "High", "Volume", "Close", "Low")
+  
+  # Create a pattern to match any of these words
+  pattern <- paste(words_to_remove, collapse = "|")
+  
+  # Remove the words and periods
+  result <- gsub(pattern, "", string)
+  final_result <- gsub("\\.", "", result)
+  
+  return(final_result)
+}
+# Clean all of the top_1000_features$Feature and put them into unique_ones
+unique_ones = c()
+for (i in 1:500) {
+  # Clean each feature in the top_1000_features$Feature
+  cleaned_string <- clean_string(top_1000_features$Feature[i])
+  
+  # Append to unique_ones if it's not already present
+  if (!(cleaned_string %in% unique_ones)) {
+    unique_ones <- c(unique_ones, cleaned_string)
+  }
+}
+
+length(unique_ones)
+```
+
+## Train a Bayesian regression model with spike-and-slab prior
+
+```{r}
+# Compile the Stan model
+spike_and_slab_code <- readLines("spike-and-slab_model.stan")
+spike_and_slab <- stan_model(model_code = spike_and_slab_code)
+
+# Fit the model
+ss_fit <- sampling(
+  spike_and_slab,
+  data = stan_data,
+  iter = 2000,             # Number of iterations
+  chains = 4,              # Number of chains
+  warmup = 500,            # Number of warmup (burn-in) samples
+  thin = 1,                # Thinning interval
+  seed = 123               # Random seed for reproducibility
+)
+```
+
+## Extract model fit
+
+```{r}
+
+```
